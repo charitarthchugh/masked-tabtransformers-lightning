@@ -42,7 +42,7 @@ from tabular_module import TabTransformerModuleforMLM
 )
 @click.option(
     "--batch-size",
-    type=int | str,
+    type=int,
     default=128,
     show_default=True,
     help="Batch size for training and evaluation. if input is 'auto', it will be automatically using a batch size "
