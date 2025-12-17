@@ -2,7 +2,7 @@ import click
 import pandas as pd
 
 import lightning as L
-from lightning.pytorch.callbacks import BatchSizeFinder
+from lightning.pytorch.callbacks import BatchSizeFinder, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from tabular_datamodule import TabularDataModule
@@ -46,7 +46,7 @@ from tabular_module import TabTransformerModuleforMLM
     default=128,
     show_default=True,
     help="Batch size for training and evaluation. if input is 'auto', it will be automatically using a batch size "
-         " finder",
+    " finder",
 )
 @click.option(
     "--num-epochs",
@@ -83,18 +83,18 @@ from tabular_module import TabTransformerModuleforMLM
 )
 @click.option("--seed", type=int, default=42, help="Random seed for reproducibility.")
 def train_script(
-        train_data_path,
-        val_data_path,
-        test_data_path,
-        categorical_columns,
-        numerical_columns,
-        batch_size,
-        num_epochs,
-        learning_rate,
-        output_dir,
-        logger,
-        wandb_project_name,
-        seed,
+    train_data_path,
+    val_data_path,
+    test_data_path,
+    categorical_columns,
+    numerical_columns,
+    batch_size,
+    num_epochs,
+    learning_rate,
+    output_dir,
+    logger,
+    wandb_project_name,
+    seed,
 ):
     """
     Training script for TabTransformer using Click for CLI.
@@ -130,12 +130,12 @@ def train_script(
         ff_dropout=0.1,
         null_token=data_module.metadata.categorical_encoder.null_token,
         continuous_mean_std=data_module.continuous_mean_std,
-        leasing_rate=learning_rate,
+        learning_rate=learning_rate,
     )
     callbacks = []
     # Setup logger & checkpointing
     callbacks.append(
-        L.callbacks.ModelCheckpoint(
+        ModelCheckpoint(
             monitor="val_loss",
             dirpath=output_dir,
             filename="tab-transformer-{epoch:02d}-{val_loss:.2f}",
@@ -143,7 +143,7 @@ def train_script(
             mode="min",
         )
     )
-    if batch_size == "auto":
+    if batch_size == -1:
         callbacks.append(BatchSizeFinder(mode="binsearch"))
     # Trainer
 
