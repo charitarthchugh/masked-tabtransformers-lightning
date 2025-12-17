@@ -2,7 +2,7 @@ import json
 import logging
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, cast
 
 import lightning
 import numpy as np
@@ -125,7 +125,7 @@ class CategoricalEncoder:
 
         encoders = {}
         for col in params:
-            if params[col]:
+            if params[col] is not None:
                 le = LabelEncoder()
                 le.set_params(**params[col])
                 encoders[col] = le
@@ -147,12 +147,12 @@ class TabularMetaData:
     def __init__(
         self,
         categorical_encoder: CategoricalEncoder,
-        numerical_col_names: list[str] = (),
+        numerical_col_names: list[str] | None = None,
     ):
         self.categorical_encoder = categorical_encoder
         self.categorical_columns = categorical_encoder.categorical_columns
         self.categorical_cardinality = categorical_encoder.cardinality
-        self.numerical_col_names = numerical_col_names
+        self.numerical_col_names = numerical_col_names or []
 
     def save(self, filepath: str | Path):
         # write categorical encoders to file
@@ -192,13 +192,17 @@ class MaskedTabularDataset(Dataset):
         compute_attorney_specialization=False,
     ):
         self.df = df
-        self.categorical_columns = set(categorical_columns)
-        self.numerical_columns = set(numerical_columns)
+        self.categorical_columns = (
+            set(categorical_columns) if categorical_columns else set()
+        )
+        self.numerical_columns = set(numerical_columns) if numerical_columns else set()
         self.categorical_encoder = categorical_encoder
         self.continuous_mean_std = continuous_mean_std
         self.mask_prob = mask_prob
         self.mask_token = categorical_encoder.masked_token
-        self.numerical_mask_type = numerical_mask_type
+        self.numerical_mask_type = cast(
+            Literal["random", "null_token", "mean"], numerical_mask_type
+        )
         self.compute_attorney_specialization = compute_attorney_specialization
 
         if self.numerical_mask_type not in ["random", "null_token", "mean"]:
@@ -259,7 +263,8 @@ class MaskedTabularDataset(Dataset):
 
                 if self.numerical_mask_type == "mean":
                     for col in list(intersection):
-                        masked_sample[col] = self.continuous_mean_std[col]["mean"]
+                        if self.continuous_mean_std and col in self.continuous_mean_std:
+                            masked_sample[col] = self.continuous_mean_std[col]["mean"]
         # Empty tensors should have a shape batch_size,0. tab-transformers-pytorch checks the shape of the 2nd dim in
         # order to validate a tensor input
         return {
@@ -299,17 +304,20 @@ class TabularDataModule(lightning.LightningDataModule):
         super().save_hyperparameters()
 
         if data_dir is not None:
+            data_dir = Path(data_dir)
             self.train_df = pd.read_csv(data_dir / "train.csv")
             self.val_df = pd.read_csv(data_dir / "valid.csv")
             self.test_df = pd.read_csv(data_dir / "test.csv")
         else:
-        self.train_df = train_df
-        self.val_df = val_df
-        self.test_df = test_df
+            self.train_df = train_df
+            self.val_df = val_df
+            self.test_df = test_df
         self.categorical_columns = categorical_columns or []
         self.numerical_columns = numerical_columns if numerical_columns else []
         self.mask_prob = mask_prob
-        self.numerical_mask_type = numerical_mask_type
+        self.numerical_mask_type = cast(
+            Literal["random", "null_token", "mean"], numerical_mask_type
+        )
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
@@ -322,18 +330,19 @@ class TabularDataModule(lightning.LightningDataModule):
         self.compute_attorney_specialization = compute_attorney_specialization
         # if self.compute_attorney_specialization:
         #     self.categorical_columns.remove("CaseAttorneyJuris")
-        self.categorical_encoder = CategoricalEncoder(categorical_columns)
+        self.categorical_encoder = CategoricalEncoder(self.categorical_columns)
 
         if self.numerical_columns and self.numerical_mask_type == "mean":
             # Compute mean and std. dev for each numerical column
-            mean_std_df = pd.concat(
-                [
-                    self.train_df[self.numerical_columns].mean(),
-                    self.train_df[self.numerical_columns].std(),
-                ],
-                axis=1,
-            )
-            self.continuous_mean_std = mean_std_df.to_dict()
+            if self.train_df is not None:
+                mean_std_df = pd.concat(
+                    [
+                        self.train_df[self.numerical_columns].mean(),
+                        self.train_df[self.numerical_columns].std(),
+                    ],
+                    axis=1,
+                )
+                self.continuous_mean_std = mean_std_df.to_dict()
 
     def setup(
         self, stage: Optional[Literal["fit", "validate", "test", "predict"]] = None
@@ -350,7 +359,7 @@ class TabularDataModule(lightning.LightningDataModule):
                 self.categorical_encoder,
                 self.continuous_mean_std,
                 self.mask_prob,
-                self.numerical_mask_type,
+                cast(Literal["random", "null_token", "mean"], self.numerical_mask_type),
                 # self.compute_attorney_specialization,
             )
         if stage == "validate" or stage is None:
@@ -360,6 +369,8 @@ class TabularDataModule(lightning.LightningDataModule):
                 self.numerical_columns,
                 self.categorical_encoder,
                 self.continuous_mean_std,
+                self.mask_prob,
+                cast(Literal["random", "null_token", "mean"], self.numerical_mask_type),
                 # self.compute_attorney_specialization,
             )
         if stage == "test" or stage is None:
@@ -368,6 +379,9 @@ class TabularDataModule(lightning.LightningDataModule):
                 self.categorical_columns,
                 self.numerical_columns,
                 self.categorical_encoder,
+                self.continuous_mean_std,
+                self.mask_prob,
+                cast(Literal["random", "null_token", "mean"], self.numerical_mask_type),
                 # compute_attorney_specialization=self.compute_attorney_specialization,
             )
 
@@ -391,6 +405,9 @@ class TabularDataModule(lightning.LightningDataModule):
     def test_dataloader(self):
         return torch.utils.data.DataLoader(
             self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
         )
 
     @cached_property
