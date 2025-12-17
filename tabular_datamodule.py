@@ -48,7 +48,8 @@ class CategoricalEncoder:
         """
         df = df.map(
             lambda x: x if not pd.isna(x) else pd.NA
-        )  # Make sure the null values are of one type
+        ).dropna()  # Make sure the null values are of one type then
+        # drop them
         for column in self.categorical_columns:
             self.encoders[column] = LabelEncoder()
             self.encoders[column].fit(df[column])
@@ -76,19 +77,37 @@ class CategoricalEncoder:
         df = df.copy()
         df = df.map(lambda x: x if not pd.isna(x) else pd.NA)
         for column in self.categorical_columns:
-            df[column] = self.encoders[column].transform(df[column]) + 2
+            # df[column] = self.encoders[column].transform(df[column]) + 2
+            # see if we have any unseen values, then map them to NA.
+            unseen_values = ~df[column].isin(self.encoders[column].classes_)
+            if unseen_values.any():
+                df.loc[unseen_values, column] = pd.NA
+            # get not-null values
+            non_null_mask = df[column].notna()
+            non_null_data = df.loc[non_null_mask, column]
+
+            transformed_values = self.encoders[column].transform(non_null_data) + 2
+            # fill in at indexes of not null values
+            df.loc[non_null_mask, column] = transformed_values
+        df = df.convert_dtypes()
         df[self.categorical_columns] = df[self.categorical_columns].fillna(
             self.null_token
         )
         return df
 
     def inverse_transform(self, df: pd.DataFrame):
+        df = df.copy()
         for column in self.categorical_columns:
-            df[column] = self.encoders[column].inverse_transform(df[column] - 2)
-        # map null_token to NaN
-        df[self.categorical_columns] = df[self.categorical_columns].replace(
-            {self.null_token: np.nan}
-        )
+            col: pd.Series = df[column] - 2
+            # find the index of values greater than zero
+            non_null_mask = col >= 0
+            if (col == -1).any():
+                df.loc[col == -1, column] = pd.NA
+            if (col == -2).any():
+                df.loc[col == -2, column] = "[MASK]"
+            df.loc[non_null_mask, column] = self.encoders[column].inverse_transform(
+                col.loc[non_null_mask]
+            )
         return df
 
     def fit_transform(self, df: pd.DataFrame):
@@ -170,6 +189,7 @@ class MaskedTabularDataset(Dataset):
         continuous_mean_std: Optional[dict[str, dict[str, float]]] = None,
         mask_prob: float = 0.15,  # Hyperparam
         numerical_mask_type: Literal["random", "null_token", "mean"] = "null_token",
+        compute_attorney_specialization=False,
     ):
         self.df = df
         self.categorical_columns = set(categorical_columns)
@@ -179,11 +199,8 @@ class MaskedTabularDataset(Dataset):
         self.mask_prob = mask_prob
         self.mask_token = categorical_encoder.masked_token
         self.numerical_mask_type = numerical_mask_type
+        self.compute_attorney_specialization = compute_attorney_specialization
 
-        if not self.categorical_columns and not self.numerical_columns:
-            raise ValueError(
-                "At least one of categorical_columns or numerical_columns must be specified"
-            )
         if self.numerical_mask_type not in ["random", "null_token", "mean"]:
             raise ValueError(
                 "numerical_mask_type must be one of 'random', 'null_token', 'mean'"
@@ -192,14 +209,21 @@ class MaskedTabularDataset(Dataset):
             raise ValueError(
                 "continuous_mean_std must be provided if numerical_mask_type is 'mean'"
             )
-        if self.categorical_columns:
-            self.df = categorical_encoder.transform(self.df)
-
         if self.categorical_columns and self.numerical_columns:
             # Reorder the columns so that the positioning is consistent
             self.df = self.df[
                 list(self.categorical_columns) + list(self.numerical_columns)
             ]
+            self.df = self.categorical_encoder.transform(self.df)
+        elif self.categorical_columns:
+            self.df = self.df[list(self.categorical_columns)]
+            self.df = self.categorical_encoder.transform(self.df)
+        elif self.numerical_columns:
+            self.df = self.df[list(self.numerical_columns)]
+        else:
+            raise ValueError(
+                "At least one of categorical_columns or numerical_columns must be provided"
+            )
 
     def __len__(self):
         return len(self.df)
@@ -225,7 +249,6 @@ class MaskedTabularDataset(Dataset):
                 if self.numerical_mask_type == "random":
                     # for each numerical column choose a random value from the range of the column's minimum value to
                     # the column's maximum value
-
                     for col in list(intersection):
                         min_val = self.df[col].min()
                         max_val = self.df[col].max()
@@ -241,27 +264,31 @@ class MaskedTabularDataset(Dataset):
         # order to validate a tensor input
         return {
             "masked_categorical": torch.tensor(
-                masked_sample[list(self.categorical_columns)].to_numpy()
+                masked_sample[list(self.categorical_columns)].to_numpy(),
+                dtype=torch.long,
             )
             if self.categorical_columns
-            else torch.tensor([[]]),
-            "masked_numerical": torch.tensor(
-                masked_sample[list(self.numerical_columns)].to_numpy()
-                if self.numerical_columns
-                else torch.tensor([[]])
-            ),
-            "original": torch.tensor(sample.to_numpy()),
+            else torch.empty(0),
+            "masked_continuous": torch.tensor(
+                masked_sample[list(self.numerical_columns)].to_numpy(),
+                dtype=torch.float,
+            )
+            if self.numerical_columns
+            else torch.empty(0),
+            "original": torch.tensor(sample.to_numpy(), dtype=torch.float),
         }
 
 
 class TabularDataModule(lightning.LightningDataModule):
     def __init__(
         self,
-        train_df: pd.DataFrame,
-        val_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        categorical_columns: list[str],
-        numerical_columns: list[str],
+        data_dir: str | Path | None = None,
+        train_df: pd.DataFrame | None = None,
+        val_df: pd.DataFrame | None = None,
+        test_df: pd.DataFrame | None = None,
+        categorical_columns: list[str] | None = None,
+        numerical_columns: Optional[list[str]] = None,
+        compute_attorney_specialization=False,
         mask_prob: float = 0.15,
         numerical_mask_type: Literal["random", "null_token", "mean"] = "null_token",
         batch_size: int = 128,
@@ -271,11 +298,16 @@ class TabularDataModule(lightning.LightningDataModule):
         super().__init__()
         super().save_hyperparameters()
 
+        if data_dir is not None:
+            self.train_df = pd.read_csv(data_dir / "train.csv")
+            self.val_df = pd.read_csv(data_dir / "valid.csv")
+            self.test_df = pd.read_csv(data_dir / "test.csv")
+        else:
         self.train_df = train_df
         self.val_df = val_df
         self.test_df = test_df
-        self.categorical_columns = categorical_columns
-        self.numerical_columns = numerical_columns
+        self.categorical_columns = categorical_columns or []
+        self.numerical_columns = numerical_columns if numerical_columns else []
         self.mask_prob = mask_prob
         self.numerical_mask_type = numerical_mask_type
         self.batch_size = batch_size
@@ -287,7 +319,9 @@ class TabularDataModule(lightning.LightningDataModule):
         self.train_dataset: Optional[MaskedTabularDataset] = None
         self.val_dataset: Optional[MaskedTabularDataset] = None
         self.test_dataset: Optional[MaskedTabularDataset] = None
-
+        self.compute_attorney_specialization = compute_attorney_specialization
+        # if self.compute_attorney_specialization:
+        #     self.categorical_columns.remove("CaseAttorneyJuris")
         self.categorical_encoder = CategoricalEncoder(categorical_columns)
 
         if self.numerical_columns and self.numerical_mask_type == "mean":
@@ -301,7 +335,9 @@ class TabularDataModule(lightning.LightningDataModule):
             )
             self.continuous_mean_std = mean_std_df.to_dict()
 
-    def setup(self, stage: Literal["fit", "validate", "test", "predict"]) -> None:
+    def setup(
+        self, stage: Optional[Literal["fit", "validate", "test", "predict"]] = None
+    ) -> None:
         if self.categorical_columns:
             self.categorical_encoder = CategoricalEncoder(self.categorical_columns)
             self.categorical_encoder.fit(self.train_df)
@@ -315,6 +351,7 @@ class TabularDataModule(lightning.LightningDataModule):
                 self.continuous_mean_std,
                 self.mask_prob,
                 self.numerical_mask_type,
+                # self.compute_attorney_specialization,
             )
         if stage == "validate" or stage is None:
             self.val_dataset = MaskedTabularDataset(
@@ -323,11 +360,15 @@ class TabularDataModule(lightning.LightningDataModule):
                 self.numerical_columns,
                 self.categorical_encoder,
                 self.continuous_mean_std,
+                # self.compute_attorney_specialization,
             )
         if stage == "test" or stage is None:
             self.test_dataset = MaskedTabularDataset(
                 self.test_df,
                 self.categorical_columns,
+                self.numerical_columns,
+                self.categorical_encoder,
+                # compute_attorney_specialization=self.compute_attorney_specialization,
             )
 
     def train_dataloader(self):
@@ -342,6 +383,9 @@ class TabularDataModule(lightning.LightningDataModule):
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
             self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
         )
 
     def test_dataloader(self):

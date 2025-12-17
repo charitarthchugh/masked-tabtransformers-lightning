@@ -20,16 +20,16 @@ class TabTransformerModuleforMLM(L.LightningModule):
         continuous_mean_std=None,
         null_token: int = 1,
         return_attention: bool = False,
-        leasing_rate: float = 0.001,
+        learning_rate: float = 0.001,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__()
         self.save_hyperparameters()
         if not mlp_act:
             mlp_act = nn.ReLU()
         self.null_token = null_token
         self.return_attention = return_attention
-        self.learning_rate = leasing_rate
+        self.learning_rate = learning_rate
         # model instantiation copied from example
         self.model = TabTransformer(
             categories=categorical_unique_counts,
