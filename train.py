@@ -1,9 +1,9 @@
 import click
 import pandas as pd
-import pytorch_lightning as pl
+
+import lightning as L
 from lightning.pytorch.callbacks import BatchSizeFinder
-from lightning.pytorch.loggers import TensorBoardLogger
-from pytorch_lightning.loggers import WandbLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
 from tabular_datamodule import TabularDataModule
 from tabular_module import TabTransformerModuleforMLM
@@ -46,7 +46,7 @@ from tabular_module import TabTransformerModuleforMLM
     default=128,
     show_default=True,
     help="Batch size for training and evaluation. if input is 'auto', it will be automatically using a batch size "
-    " finder",
+         " finder",
 )
 @click.option(
     "--num-epochs",
@@ -83,18 +83,18 @@ from tabular_module import TabTransformerModuleforMLM
 )
 @click.option("--seed", type=int, default=42, help="Random seed for reproducibility.")
 def train_script(
-    train_data_path,
-    val_data_path,
-    test_data_path,
-    categorical_columns,
-    numerical_columns,
-    batch_size,
-    num_epochs,
-    learning_rate,
-    output_dir,
-    logger,
-    wandb_project_name,
-    seed,
+        train_data_path,
+        val_data_path,
+        test_data_path,
+        categorical_columns,
+        numerical_columns,
+        batch_size,
+        num_epochs,
+        learning_rate,
+        output_dir,
+        logger,
+        wandb_project_name,
+        seed,
 ):
     """
     Training script for TabTransformer using Click for CLI.
@@ -135,7 +135,7 @@ def train_script(
     callbacks = []
     # Setup logger & checkpointing
     callbacks.append(
-        pl.callbacks.ModelCheckpoint(
+        L.callbacks.ModelCheckpoint(
             monitor="val_loss",
             dirpath=output_dir,
             filename="tab-transformer-{epoch:02d}-{val_loss:.2f}",
@@ -147,7 +147,7 @@ def train_script(
         callbacks.append(BatchSizeFinder(mode="binsearch"))
     # Trainer
 
-    trainer = pl.Trainer(
+    trainer = L.Trainer(
         max_epochs=num_epochs,
         logger=WandbLogger(project=wandb_project_name)
         if logger == "wandb"
