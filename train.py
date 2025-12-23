@@ -1,7 +1,6 @@
 import click
-import pandas as pd
-
 import lightning as L
+import pandas as pd
 from lightning.pytorch.callbacks import BatchSizeFinder, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
@@ -119,16 +118,18 @@ def train_script(
         batch_size=batch_size,
     )
 
+    # Setup data module to fit encoders
+    data_module.setup("fit")
+
     # Initialize the model
     model = TabTransformerModuleforMLM(
-        categorical_unique_counts=data_module.metadata.categorical_cardinality,
+        categorical_unique_counts=tuple(data_module.metadata.categorical_cardinality),
         num_continuous=len(data_module.metadata.numerical_col_names),
         dim=32,  # You may make this a CLI option if needed
         depth=6,  # Adjust to your needs
         heads=8,
         attn_dropout=0.1,
         ff_dropout=0.1,
-        null_token=data_module.metadata.categorical_encoder.null_token,
         continuous_mean_std=data_module.continuous_mean_std,
         learning_rate=learning_rate,
     )
@@ -157,7 +158,8 @@ def train_script(
         callbacks=callbacks,
         log_every_n_steps=1,
         deterministic=True,
-        detect_anomaly=True,
+        # Use CUDA for training
+        accelerator="cuda",
     )
 
     # Start training

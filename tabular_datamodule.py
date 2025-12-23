@@ -16,25 +16,22 @@ pylogger = logging.getLogger(__name__)
 
 class CategoricalEncoder:
     """
-    Encodes categorical variables into numeric representations suitable for machine learning models.
+    Encodes categorical variables into 0-indexed numeric representations for TabTransformer.
 
-    The `CategoricalEncoder` class provides functionality to handle categorical data by assigning
-    numeric codes through label encoding. It supports fitting the encoder to data, transforming
-    data into encoded formats, inverse transformation back to original categories, and the
-    ability to save and load encoding parameters.
+    TabTransformer expects:
+    - Regular values: 0, 1, 2, ... (0-indexed per feature)
+    - TabTransformer handles special tokens internally in its embedding table
+
+    For MLM masking, we use -1 as the mask token (handled separately in forward pass).
 
     Attributes:
         categorical_columns (list[str]): Names of the columns to encode.
-        masked_token (int): Reserved token for masked values during encoding.
-        null_token (int): Reserved token for missing values during encoding.
         encoders (dict[str, LabelEncoder]): Dictionary of column names mapped to their fitted
             label encoders.
     """
 
     def __init__(self, categorical_columns: list[str]):
         self.categorical_columns = categorical_columns
-        self.masked_token = 0
-        self.null_token = 1
         self.encoders = {}
 
     def fit(self, df: pd.DataFrame) -> None:
@@ -56,58 +53,56 @@ class CategoricalEncoder:
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Transforms the categorical columns of the given dataframe using the encoders fitted
-        on the initial data. The encoded values are incremented by 2, and missing values in
-        the categorical columns are filled with the specified null token.
+        Transforms categorical columns to 0-indexed values (0, 1, 2, ...) per feature.
+        Missing values are filled with -1 and will be handled specially.
 
         Args:
-            df (pd.DataFrame): A pandas DataFrame containing the data to be transformed. It
-                must include the categorical columns that were used during the fitting
-                process.
+            df (pd.DataFrame): DataFrame to transform
 
         Returns:
-            pd.DataFrame: A transformed pandas DataFrame with encoded categorical columns.
+            pd.DataFrame: Transformed DataFrame with 0-indexed categorical columns
 
         Raises:
-            ValueError: If the encoder has not been fitted before invoking the method.
+            ValueError: If encoder not fitted
         """
-        # Check if fitted
         if not self.encoders:
             raise ValueError("Encoder not fitted yet")
+
         df = df.copy()
         df = df.map(lambda x: x if not pd.isna(x) else pd.NA)
+
         for column in self.categorical_columns:
-            # df[column] = self.encoders[column].transform(df[column]) + 2
-            # see if we have any unseen values, then map them to NA.
+            # Map unseen values to NA
             unseen_values = ~df[column].isin(self.encoders[column].classes_)
             if unseen_values.any():
                 df.loc[unseen_values, column] = pd.NA
-            # get not-null values
+
+            # Transform to 0-indexed values
             non_null_mask = df[column].notna()
             non_null_data = df.loc[non_null_mask, column]
 
-            transformed_values = self.encoders[column].transform(non_null_data) + 2
-            # fill in at indexes of not null values
+            # Simple 0-indexed encoding (0, 1, 2, ...)
+            transformed_values = self.encoders[column].transform(non_null_data)
             df.loc[non_null_mask, column] = transformed_values
+
         df = df.convert_dtypes()
-        df[self.categorical_columns] = df[self.categorical_columns].fillna(
-            self.null_token
-        )
+        # Fill missing with -1 (will be handled as special case)
+        df[self.categorical_columns] = df[self.categorical_columns].fillna(-1)
         return df
 
     def inverse_transform(self, df: pd.DataFrame):
         df = df.copy()
         for column in self.categorical_columns:
-            col: pd.Series = df[column] - 2
-            # find the index of values greater than zero
-            non_null_mask = col >= 0
+            col = df[column]
+            # Mark masked/missing values
             if (col == -1).any():
-                df.loc[col == -1, column] = pd.NA
-            if (col == -2).any():
-                df.loc[col == -2, column] = "[MASK]"
-            df.loc[non_null_mask, column] = self.encoders[column].inverse_transform(
-                col.loc[non_null_mask]
-            )
+                df.loc[col == -1, column] = "[MISSING/MASKED]"
+            # Transform valid indices back to original values
+            valid_mask = col >= 0
+            if valid_mask.any():
+                df.loc[valid_mask, column] = self.encoders[column].inverse_transform(
+                    col.loc[valid_mask].astype(int)
+                )
         return df
 
     def fit_transform(self, df: pd.DataFrame):
@@ -192,14 +187,11 @@ class MaskedTabularDataset(Dataset):
         compute_attorney_specialization=False,
     ):
         self.df = df
-        self.categorical_columns = (
-            set(categorical_columns) if categorical_columns else set()
-        )
-        self.numerical_columns = set(numerical_columns) if numerical_columns else set()
+        self.categorical_columns = list(categorical_columns) if categorical_columns else []
+        self.numerical_columns = list(numerical_columns) if numerical_columns else []
         self.categorical_encoder = categorical_encoder
         self.continuous_mean_std = continuous_mean_std
         self.mask_prob = mask_prob
-        self.mask_token = categorical_encoder.masked_token
         self.numerical_mask_type = cast(
             Literal["random", "null_token", "mean"], numerical_mask_type
         )
@@ -236,37 +228,19 @@ class MaskedTabularDataset(Dataset):
         sample: pd.Series = self.df.iloc[idx]
 
         masked_sample: pd.Series = sample.copy()
-        # Randomly select columns to mask
-        mask = np.random.random_sample(size=len(self.df.columns)) < self.mask_prob
-        # map masks to column_names
-        masked_columns = set(self.df.columns[mask].to_list())
+        # Randomly select ONLY CATEGORICAL columns to mask (per paper)
+        # Paper: "MLM randomly selects k% features from index 1 to m and masks them as missing"
+        categorical_mask = (
+            np.random.random_sample(size=len(self.categorical_columns)) < self.mask_prob
+        )
 
+        # Apply masking: set masked positions to -1
         if self.categorical_columns:
-            # find the intersection between masked columns and categorical
-            intersection = masked_columns & self.categorical_columns
-            if intersection:
-                masked_sample[list(intersection)] = self.mask_token
+            for i, col in enumerate(self.categorical_columns):
+                if categorical_mask[i]:
+                    masked_sample[col] = -1  # Use -1 as mask token
 
-        if self.numerical_columns:
-            intersection = masked_columns & self.numerical_columns
-            if intersection:
-                if self.numerical_mask_type == "random":
-                    # for each numerical column choose a random value from the range of the column's minimum value to
-                    # the column's maximum value
-                    for col in list(intersection):
-                        min_val = self.df[col].min()
-                        max_val = self.df[col].max()
-                        masked_sample[col] = np.random.uniform(min_val, max_val)
-
-                if self.numerical_mask_type == "null_token":
-                    masked_sample[list(intersection)] = self.mask_token
-
-                if self.numerical_mask_type == "mean":
-                    for col in list(intersection):
-                        if self.continuous_mean_std and col in self.continuous_mean_std:
-                            masked_sample[col] = self.continuous_mean_std[col]["mean"]
-        # Empty tensors should have a shape batch_size,0. tab-transformers-pytorch checks the shape of the 2nd dim in
-        # order to validate a tensor input
+        # Numerical columns are NOT masked in MLM pretraining
         return {
             "masked_categorical": torch.tensor(
                 masked_sample[list(self.categorical_columns)].to_numpy(),
@@ -280,7 +254,21 @@ class MaskedTabularDataset(Dataset):
             )
             if self.numerical_columns
             else torch.empty(0),
-            "original": torch.tensor(sample.to_numpy(), dtype=torch.float),
+            "original_categorical": torch.tensor(
+                sample[list(self.categorical_columns)].to_numpy(),
+                dtype=torch.long,
+            )
+            if self.categorical_columns
+            else torch.empty(0),
+            "original_continuous": torch.tensor(
+                sample[list(self.numerical_columns)].to_numpy(),
+                dtype=torch.float,
+            )
+            if self.numerical_columns
+            else torch.empty(0),
+            "mask": torch.tensor(categorical_mask, dtype=torch.bool)
+            if self.categorical_columns
+            else torch.empty(0, dtype=torch.bool),
         }
 
 
@@ -332,6 +320,11 @@ class TabularDataModule(lightning.LightningDataModule):
         #     self.categorical_columns.remove("CaseAttorneyJuris")
         self.categorical_encoder = CategoricalEncoder(self.categorical_columns)
 
+        if self.numerical_columns:
+            self.train_df, numerical_means = self._coerce_numerical(self.train_df)
+            self.val_df, _ = self._coerce_numerical(self.val_df, numerical_means)
+            self.test_df, _ = self._coerce_numerical(self.test_df, numerical_means)
+
         if self.numerical_columns and self.numerical_mask_type == "mean":
             # Compute mean and std. dev for each numerical column
             if self.train_df is not None:
@@ -344,15 +337,32 @@ class TabularDataModule(lightning.LightningDataModule):
                 )
                 self.continuous_mean_std = mean_std_df.to_dict()
 
+    def _coerce_numerical(
+        self, df: pd.DataFrame, means: pd.Series | None = None
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        df = df.copy()
+        for col in self.numerical_columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[self.numerical_columns] = df[self.numerical_columns].replace(
+            [np.inf, -np.inf], np.nan
+        )
+        if means is None:
+            means = df[self.numerical_columns].mean()
+        fill_values = means.fillna(0.0)
+        df[self.numerical_columns] = df[self.numerical_columns].fillna(fill_values)
+        return df, means
+
     def setup(
         self, stage: Optional[Literal["fit", "validate", "test", "predict"]] = None
     ) -> None:
-        if self.categorical_columns:
+        # Only fit encoder once
+        if self.categorical_columns and not self.categorical_encoder.encoders:
             self.categorical_encoder = CategoricalEncoder(self.categorical_columns)
             self.categorical_encoder.fit(self.train_df)
 
         if stage == "fit" or stage is None:
-            self.train_dataset = MaskedTabularDataset(
+            if self.train_dataset is None:  # Only create once
+                self.train_dataset = MaskedTabularDataset(
                 self.train_df,
                 self.categorical_columns,
                 self.numerical_columns,
@@ -362,8 +372,9 @@ class TabularDataModule(lightning.LightningDataModule):
                 cast(Literal["random", "null_token", "mean"], self.numerical_mask_type),
                 # self.compute_attorney_specialization,
             )
-        if stage == "validate" or stage is None:
-            self.val_dataset = MaskedTabularDataset(
+        if stage == "fit" or stage == "validate" or stage is None:
+            if self.val_dataset is None:  # Only create once
+                self.val_dataset = MaskedTabularDataset(
                 self.val_df,
                 self.categorical_columns,
                 self.numerical_columns,
@@ -412,4 +423,4 @@ class TabularDataModule(lightning.LightningDataModule):
 
     @cached_property
     def metadata(self):
-        return TabularMetaData(self.categorical_encoder)
+        return TabularMetaData(self.categorical_encoder, self.numerical_columns)
