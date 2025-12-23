@@ -6,15 +6,16 @@ authors = ["Charitarth Chugh <37895518+charitarthchugh@users.noreply.github.com>
 package-mode = false
 
 [tool.poetry.dependencies]
-python = "^3.10"
-torch = "^2.5.1"
-lightning = "^2.5.0.post0"
-wandb = "^0.19.1"
+python = "^3.10,<3.15"
+torch = "^2.9.1"
+lightning = "^2.6.0"
 scikit-learn = "^1.6.0"
 pandas = "^2.2.3"
-tab-transformer-pytorch = "^0.4.1"
-hyper-connections = "^0.1.5"
+tab-transformer-pytorch = "^0.5.3"
+hyper-connections = "^0.2.1"
 click = "^8.1.8"
+tensorboard = "^2.20.0"
+wandb = "^0.23.1"
 
 
 [tool.poetry.group.dev.dependencies]
